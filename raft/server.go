@@ -83,7 +83,7 @@ func (s *Server) Serve() {
 	}()
 }
 
-func (s *Server) Submit(cmd any) int {
+func (s *Server) Submit(cmd any) SubmitResult {
 	return s.cm.Submit(cmd)
 }
 

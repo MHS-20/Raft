@@ -119,8 +119,20 @@ func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
 	return cm.id, cm.currentTerm, cm.state == Leader
 }
 
-// Submit submits a new command to the CM
-func (cm *ConsensusModule) Submit(command any) int {
+// SubmitResult is returned by Submit to tell the caller whether the command
+// was accepted and, if not, which node is believed to be the current leader.
+type SubmitResult struct {
+	// Index is the log index assigned to the command, or -1 if not accepted.
+	Index int
+	// IsLeader is true when the command was accepted by this node.
+	IsLeader bool
+	// LeaderHint is the ID of the node this server believes is the current
+	// leader, or -1 if unknown. Clients can use this to redirect their request.
+	LeaderHint int
+}
+
+// Submit submits a new command to the CM. It returns a SubmitResult
+func (cm *ConsensusModule) Submit(command any) SubmitResult {
 	cm.mu.Lock()
 	cm.dlog("Submit received by %v: %v", cm.state, command)
 	if cm.state == Leader {
@@ -130,11 +142,15 @@ func (cm *ConsensusModule) Submit(command any) int {
 		cm.dlog("... log=%v", cm.log)
 		cm.mu.Unlock()
 		cm.triggerAEChan <- struct{}{}
-		return submitIndex
+		return SubmitResult{Index: submitIndex, IsLeader: true, LeaderHint: cm.id}
 	}
 
+	// Not the leader — return the best hint we have about who is.
+	// votedFor is the last node this server voted for, which is the most
+	// recent leader hint we have; if we haven't voted yet, return -1.
+	hint := cm.votedFor
 	cm.mu.Unlock()
-	return -1
+	return SubmitResult{Index: -1, IsLeader: false, LeaderHint: hint}
 }
 
 func (cm *ConsensusModule) Stop() {
@@ -172,6 +188,23 @@ func (cm *ConsensusModule) restoreFromStorage() {
 		}
 	} else {
 		log.Fatal("log not found in storage")
+	}
+}
+
+type persistentState struct {
+	currentTerm int
+	votedFor    int
+	logLen      int
+}
+
+func (cm *ConsensusModule) captureState() persistentState {
+	return persistentState{cm.currentTerm, cm.votedFor, len(cm.log)}
+}
+
+func (cm *ConsensusModule) persistIfChanged(before persistentState) {
+	after := cm.captureState()
+	if after != before {
+		cm.persistToStorage()
 	}
 }
 
@@ -224,6 +257,8 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
 	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d, log index/term=(%d, %d)]", args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm)
 
+	before := cm.captureState()
+
 	if args.Term > cm.currentTerm {
 		cm.dlog("... term out of date in RequestVote")
 		cm.becomeFollower(args.Term)
@@ -240,7 +275,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 		reply.VoteGranted = false
 	}
 	reply.Term = cm.currentTerm
-	cm.persistToStorage()
+	cm.persistIfChanged(before)
 	cm.dlog("... RequestVote reply: %+v", reply)
 	return nil
 }
@@ -271,6 +306,8 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		return nil
 	}
 	cm.dlog("AppendEntries: %+v", args)
+
+	before := cm.captureState()
 
 	if args.Term > cm.currentTerm {
 		cm.dlog("... term out of date in AppendEntries")
@@ -332,12 +369,12 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	}
 
 	reply.Term = cm.currentTerm
-	cm.persistToStorage()
+	cm.persistIfChanged(before)
 	cm.dlog("AppendEntries reply: %+v", *reply)
 	return nil
 }
 
-// electionTimeout generates a pseudo-random election timeout duration.
+// generates a pseudo-random election timeout duration.
 func (cm *ConsensusModule) electionTimeout() time.Duration {
 	if len(os.Getenv("RAFT_FORCE_MORE_REELECTION")) > 0 && rand.Intn(3) == 0 {
 		return time.Duration(150) * time.Millisecond
@@ -522,7 +559,10 @@ func (cm *ConsensusModule) leaderSendAEs() {
 			if prevLogIndex >= 0 {
 				prevLogTerm = cm.log[prevLogIndex].Term
 			}
-			entries := cm.log[ni:]
+			// Snapshot the slice so the RPC sends consistent data even if the
+			// leader appends more entries before the goroutine's Call returns.
+			entries := make([]LogEntry, len(cm.log[ni:]))
+			copy(entries, cm.log[ni:])
 
 			args := AppendEntriesArgs{
 				Term:         savedCurrentTerm,
@@ -615,7 +655,6 @@ func (cm *ConsensusModule) commitChanSender() {
 	for range cm.newCommitReadyChan {
 		// Find which entries we have to apply.
 		cm.mu.Lock()
-		savedTerm := cm.currentTerm
 		savedLastApplied := cm.lastApplied
 		var entries []LogEntry
 		if cm.commitIndex > cm.lastApplied {
@@ -630,7 +669,7 @@ func (cm *ConsensusModule) commitChanSender() {
 			cm.commitChan <- CommitEntry{
 				Command: entry.Command,
 				Index:   savedLastApplied + i + 1,
-				Term:    savedTerm,
+				Term:    entry.Term,
 			}
 		}
 	}
