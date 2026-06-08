@@ -25,6 +25,11 @@ type Harness struct {
 	// channel.
 	commits [][]CommitEntry
 
+	// snapshots at index i holds all SnapshotEntry values delivered to server i
+	// via InstallSnapshotRPC (i.e. snapshots received from the leader, not ones
+	// the application itself triggered).  Protected by mu.
+	snapshots [][]SnapshotEntry
+
 	// connected has a bool per server in cluster, specifying whether this server
 	// is currently connected to peers (if false, it's partitioned and no messages
 	// will pass to or from it).
@@ -48,6 +53,7 @@ func NewHarness(t *testing.T, n int) *Harness {
 	alive := make([]bool, n)
 	commitChans := make([]chan CommitEntry, n)
 	commits := make([][]CommitEntry, n)
+	snapshots := make([][]SnapshotEntry, n)
 	ready := make(chan any)
 	storage := make([]*MapStorage, n)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -84,6 +90,7 @@ func NewHarness(t *testing.T, n int) *Harness {
 		storage:     storage,
 		commitChans: commitChans,
 		commits:     commits,
+		snapshots:   snapshots,
 		connected:   connected,
 		alive:       alive,
 		n:           n,
@@ -92,6 +99,7 @@ func NewHarness(t *testing.T, n int) *Harness {
 	}
 	for i := 0; i < n; i++ {
 		go h.collectCommits(i)
+		go h.collectSnapshots(i)
 	}
 	return h
 }
@@ -156,6 +164,7 @@ func (h *Harness) CrashPeer(id int) {
 	// the whole log to us.
 	h.mu.Lock()
 	h.commits[id] = h.commits[id][:0]
+	h.snapshots[id] = h.snapshots[id][:0]
 	h.mu.Unlock()
 }
 
@@ -175,11 +184,22 @@ func (h *Harness) RestartPeer(id int) {
 	}
 
 	ready := make(chan any)
+
+	h.mu.Lock()
+	// Initialize the server under the harness lock
 	h.cluster[id] = NewServer(id, peerIds, h.storage[id], ready, h.commitChans[id], h.logger)
+	h.mu.Unlock()
+
 	h.cluster[id].Serve()
 	h.ReconnectPeer(id)
 	close(ready)
+
+	h.mu.Lock()
 	h.alive[id] = true
+	h.mu.Unlock()
+
+	// Spawn a fresh collectSnapshots loop explicitly bound to this specific module instance
+	go h.collectSnapshots(id)
 	sleepMs(20)
 }
 
@@ -357,4 +377,97 @@ func (h *Harness) collectCommits(i int) {
 		h.commits[i] = append(h.commits[i], c)
 		h.mu.Unlock()
 	}
+}
+
+// collectSnapshots drains the SnapshotReady() channel for server i and
+// records every snapshot delivered by the Raft layer (i.e. from
+// InstallSnapshotRPC). It exits when snapshotDone is closed by Stop().
+func (h *Harness) collectSnapshots(i int) {
+	// Capture the specific CM reference when the goroutine starts
+	h.mu.Lock()
+	cm := h.cluster[i].cm
+	h.mu.Unlock()
+
+	for {
+		select {
+		case snap := <-cm.SnapshotReady():
+			h.mu.Lock()
+			// Only record if this is still the active cluster node component
+			if h.cluster[i].cm == cm {
+				tlog("collectSnapshots(%d) got snapshot index=%d term=%d", i, snap.Index, snap.Term)
+				h.snapshots[i] = append(h.snapshots[i], snap)
+			}
+			h.mu.Unlock()
+		case <-cm.SnapshotDone():
+			return
+		}
+	}
+} // CheckSnapshotDelivered waits until server id has received at least one
+
+// snapshot whose Index equals wantIndex, then returns that snapshot.
+// It fails the test if no such snapshot arrives within ~5 seconds.
+func (h *Harness) CheckSnapshotDelivered(id int, wantIndex int) SnapshotEntry {
+	h.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		for _, snap := range h.snapshots[id] {
+			if snap.Index == wantIndex {
+				h.mu.Unlock()
+				return snap
+			}
+		}
+		h.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+	h.t.Fatalf("server %d never received snapshot at index %d", id, wantIndex)
+	return SnapshotEntry{}
+}
+
+// CheckNoSnapshotDelivered asserts that server id has received no snapshots yet.
+func (h *Harness) CheckNoSnapshotDelivered(id int) {
+	h.t.Helper()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.snapshots[id]) != 0 {
+		h.t.Errorf("server %d has %d snapshot(s), expected none", id, len(h.snapshots[id]))
+	}
+}
+
+// CheckCommittedIgnoringSnapshot is like CheckCommitted but does NOT require
+// that all connected servers have the same length commits slice.  This is
+// needed after a snapshot: a restarted server will have had its log replaced
+// by the snapshot and will only report the post-snapshot commits, while
+// servers that were never restarted show the full history.
+//
+// Instead of a length equality check it simply looks for cmd in each
+// connected server's commits slice and verifies that wherever it appears it
+// has the same index.
+func (h *Harness) CheckCommittedIgnoringSnapshot(cmd int) (nc int, index int) {
+	h.t.Helper()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	index = -1
+	nc = 0
+	for i := 0; i < h.n; i++ {
+		if !h.connected[i] {
+			continue
+		}
+		for _, entry := range h.commits[i] {
+			if entry.Command.(int) == cmd {
+				if index >= 0 && entry.Index != index {
+					h.t.Errorf("server %d committed cmd=%d at index=%d, want index=%d",
+						i, cmd, entry.Index, index)
+				}
+				index = entry.Index
+				nc++
+				break
+			}
+		}
+	}
+	if nc == 0 {
+		h.t.Errorf("cmd=%d not found in any connected server's commits", cmd)
+	}
+	return nc, index
 }

@@ -211,6 +211,23 @@ func (rpp *RPCProxy) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesR
 	return rpp.cm.AppendEntries(args, reply)
 }
 
+func (rpp *RPCProxy) InstallSnapshotRPC(args InstallSnapshotArgs, reply *InstallSnapshotReply) error {
+	if len(os.Getenv("RAFT_UNRELIABLE_RPC")) > 0 {
+		dice := rand.Intn(10)
+		switch dice {
+		case 9:
+			rpp.cm.logger.Debug("drop InstallSnapshot")
+			return fmt.Errorf("RPC failed")
+		case 8:
+			rpp.cm.logger.Debug("delay InstallSnapshot")
+			time.Sleep(75 * time.Millisecond)
+		}
+	} else {
+		time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
+	}
+	return rpp.cm.InstallSnapshotRPC(args, reply)
+}
+
 func (rpp *RPCProxy) Call(peer *rpc.Client, method string, args any, reply any) error {
 	rpp.mu.Lock()
 	if rpp.numCallsBeforeDrop == 0 {
