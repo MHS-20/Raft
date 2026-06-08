@@ -222,3 +222,55 @@ func (cm *ConsensusModule) runElectionTimer() {
 		cm.mu.Unlock()
 	}
 }
+
+func (cm *ConsensusModule) startElection() {
+	cm.state = Candidate
+	cm.currentTerm += 1
+	savedCurrentTerm := cm.currentTerm
+	cm.electionResetEvent = time.Now()
+	cm.votedFor = cm.id
+	cm.dlog("becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
+
+	votesReceived := 1
+
+	// Send RequestVote RPCs to all other servers concurrently.
+	for _, peerId := range cm.peerIds {
+		go func() {
+			args := RequestVoteArgs{
+				Term:        savedCurrentTerm,
+				CandidateId: cm.id,
+			}
+			var reply RequestVoteReply
+
+			cm.dlog("sending RequestVote to %d: %+v", peerId, args)
+			if err := cm.server.Call(peerId, "ConsensusModule.RequestVote", args, &reply); err == nil {
+				cm.mu.Lock()
+				defer cm.mu.Unlock()
+				cm.dlog("received RequestVoteReply %+v", reply)
+
+				if cm.state != Candidate {
+					cm.dlog("while waiting for reply, state = %v", cm.state)
+					return
+				}
+
+				if reply.Term > savedCurrentTerm {
+					cm.dlog("term out of date in RequestVoteReply")
+					cm.becomeFollower(reply.Term)
+					return
+				} else if reply.Term == savedCurrentTerm {
+					if reply.VoteGranted {
+						votesReceived += 1
+						if votesReceived*2 > len(cm.peerIds)+1 {
+							cm.dlog("wins election with %d votes", votesReceived)
+							cm.startLeader()
+							return
+						}
+					}
+				}
+			}
+		}()
+	}
+
+	// Run another election timer, in case this election is not successful.
+	go cm.runElectionTimer()
+}
