@@ -3,6 +3,8 @@ package raft
 import (
 	"fmt"
 	"log"
+	"math/rand"
+	"os"
 	"sync"
 	"time"
 )
@@ -174,4 +176,49 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	reply.Term = cm.currentTerm
 	cm.dlog("AppendEntries reply: %+v", *reply)
 	return nil
+}
+
+// electionTimeout generates a pseudo-random election timeout duration.
+func (cm *ConsensusModule) electionTimeout() time.Duration {
+	if len(os.Getenv("RAFT_FORCE_MORE_REELECTION")) > 0 && rand.Intn(3) == 0 {
+		return time.Duration(150) * time.Millisecond
+	} else {
+		return time.Duration(150+rand.Intn(150)) * time.Millisecond
+	}
+}
+
+// implements an election timer. It should be launched whenever
+// we want to start a timer towards becoming a candidate in a new election.
+func (cm *ConsensusModule) runElectionTimer() {
+	timeoutDuration := cm.electionTimeout()
+	cm.mu.Lock()
+	termStarted := cm.currentTerm
+	cm.mu.Unlock()
+	cm.dlog("election timer started (%v), term=%d", timeoutDuration, termStarted)
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		<-ticker.C
+
+		cm.mu.Lock()
+		if cm.state != Candidate && cm.state != Follower {
+			cm.dlog("in election timer state=%s, bailing out", cm.state)
+			cm.mu.Unlock()
+			return
+		}
+
+		if termStarted != cm.currentTerm {
+			cm.dlog("in election timer term changed from %d to %d, bailing out", termStarted, cm.currentTerm)
+			cm.mu.Unlock()
+			return
+		}
+
+		if elapsed := time.Since(cm.electionResetEvent); elapsed >= timeoutDuration {
+			cm.startElection()
+			cm.mu.Unlock()
+			return
+		}
+		cm.mu.Unlock()
+	}
 }
