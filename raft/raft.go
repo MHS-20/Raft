@@ -274,3 +274,68 @@ func (cm *ConsensusModule) startElection() {
 	// Run another election timer, in case this election is not successful.
 	go cm.runElectionTimer()
 }
+
+func (cm *ConsensusModule) becomeFollower(term int) {
+	cm.dlog("becomes Follower with term=%d; log=%v", term, cm.log)
+	cm.state = Follower
+	cm.currentTerm = term
+	cm.votedFor = -1
+	cm.electionResetEvent = time.Now()
+
+	go cm.runElectionTimer()
+}
+
+func (cm *ConsensusModule) startLeader() {
+	cm.state = Leader
+	cm.dlog("becomes Leader; term=%d, log=%v", cm.currentTerm, cm.log)
+
+	go func() {
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+
+		// Send periodic heartbeats, as long as still leader.
+		for {
+			cm.leaderSendHeartbeats()
+			<-ticker.C
+
+			cm.mu.Lock()
+			if cm.state != Leader {
+				cm.mu.Unlock()
+				return
+			}
+			cm.mu.Unlock()
+		}
+	}()
+}
+
+// leaderSendHeartbeats sends a round of heartbeats to all peers, collects their
+// replies and adjusts cm's state.
+func (cm *ConsensusModule) leaderSendHeartbeats() {
+	cm.mu.Lock()
+	if cm.state != Leader {
+		cm.mu.Unlock()
+		return
+	}
+	savedCurrentTerm := cm.currentTerm
+	cm.mu.Unlock()
+
+	for _, peerId := range cm.peerIds {
+		args := AppendEntriesArgs{
+			Term:     savedCurrentTerm,
+			LeaderId: cm.id,
+		}
+		go func() {
+			cm.dlog("sending AppendEntries to %v: ni=%d, args=%+v", peerId, 0, args)
+			var reply AppendEntriesReply
+			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
+				cm.mu.Lock()
+				defer cm.mu.Unlock()
+				if reply.Term > savedCurrentTerm {
+					cm.dlog("term out of date in heartbeat reply")
+					cm.becomeFollower(reply.Term)
+					return
+				}
+			}
+		}()
+	}
+}
