@@ -155,6 +155,20 @@ func (s *Server) IsLeader() bool {
 	return isLeader
 }
 
+// AddPeer adds nodeId to the cluster via a ConfigChange log entry.
+// addr is the RPC address of the new node; this server will connect to it.
+func (s *Server) AddPeer(nodeId int, addr net.Addr) bool {
+	if err := s.ConnectToPeer(nodeId, addr); err != nil {
+		return false
+	}
+	return s.cm.AddPeer(nodeId)
+}
+
+// RemovePeer removes nodeId from the cluster via a ConfigChange log entry.
+func (s *Server) RemovePeer(nodeId int) bool {
+	return s.cm.RemovePeer(nodeId)
+}
+
 func (s *Server) Proxy() *RPCProxy {
 	return s.rpcProxy
 }

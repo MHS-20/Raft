@@ -10,6 +10,10 @@ import (
 	"time"
 )
 
+func init() {
+	gob.Register(ConfigChangeEntry{})
+}
+
 // CommitEntry is the data reported by Raft to the commit channel.
 type CommitEntry struct {
 	Command any
@@ -55,13 +59,30 @@ type LogEntry struct {
 	Term    int
 }
 
+type ConfigChangeType int
+
+const (
+	AddNode ConfigChangeType = iota
+	RemoveNode
+)
+
+// ConfigChangeEntry is the Command stored in a ConfigChange log entry.
+type ConfigChangeEntry struct {
+	Type   ConfigChangeType
+	NodeId int
+}
+
 // ConsensusModule (CM) implements a single node of Raft consensus.
 type ConsensusModule struct {
 	mu sync.Mutex
 
 	id      int
-	peerIds []int
+	peerIds []int // currentConfig peers (dynamic)
 	server  *Server
+
+	// Cluster membership: pendingConfigIndex != -1 while a ConfigChange
+	// log entry has been appended but not yet committed.
+	pendingConfigIndex int
 	storage Storage
 	logger  *slog.Logger
 
@@ -177,6 +198,7 @@ func NewConsensusModule(
 	cm.lastApplied = -1
 	cm.snapshotLastIndex = -1
 	cm.snapshotLastTerm = -1
+	cm.pendingConfigIndex = -1
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
 
@@ -228,6 +250,61 @@ func (cm *ConsensusModule) Submit(command any) SubmitResult {
 	hint := cm.votedFor
 	cm.mu.Unlock()
 	return SubmitResult{Index: -1, IsLeader: false, LeaderHint: hint}
+}
+
+// AddPeer proposes adding nodeId to the cluster. Must be called on the leader.
+// Returns false if not leader or a config change is already pending.
+func (cm *ConsensusModule) AddPeer(nodeId int) bool {
+	cm.mu.Lock()
+	if cm.state != Leader || cm.pendingConfigIndex != -1 {
+		cm.mu.Unlock()
+		return false
+	}
+	for _, id := range cm.peerIds {
+		if id == nodeId {
+			cm.mu.Unlock()
+			return false // already a member
+		}
+	}
+	entry := ConfigChangeEntry{Type: AddNode, NodeId: nodeId}
+	submitIndex := cm.globalLastIndex() + 1
+	cm.log = append(cm.log, LogEntry{Command: entry, Term: cm.currentTerm})
+	cm.pendingConfigIndex = submitIndex
+	// Initialize replication state for the new peer now so AEs are sent.
+	cm.nextIndex[nodeId] = cm.globalLastIndex() + 1
+	cm.matchIndex[nodeId] = -1
+	cm.persistToStorage()
+	cm.mu.Unlock()
+	cm.triggerAEChan <- struct{}{}
+	return true
+}
+
+// RemovePeer proposes removing nodeId from the cluster. Must be called on the leader.
+func (cm *ConsensusModule) RemovePeer(nodeId int) bool {
+	cm.mu.Lock()
+	if cm.state != Leader || cm.pendingConfigIndex != -1 {
+		cm.mu.Unlock()
+		return false
+	}
+	found := false
+	for _, id := range cm.peerIds {
+		if id == nodeId {
+			found = true
+			break
+		}
+	}
+	if !found && nodeId != cm.id {
+		cm.mu.Unlock()
+		return false // not a member
+	}
+	entry := ConfigChangeEntry{Type: RemoveNode, NodeId: nodeId}
+	submitIndex := cm.globalLastIndex() + 1
+	cm.log = append(cm.log, LogEntry{Command: entry, Term: cm.currentTerm})
+	cm.pendingConfigIndex = submitIndex
+	cm.persistToStorage()
+	cm.mu.Unlock()
+	cm.triggerAEChan <- struct{}{}
+	return true
 }
 
 // InstallSnapshot is called by the application layer (or test harness) to
@@ -750,7 +827,8 @@ func (cm *ConsensusModule) startElection() {
 					return
 				} else if reply.Term == cm.currentTerm && reply.VoteGranted {
 					votesReceived++
-					if votesReceived*2 > len(cm.peerIds)+1 {
+					clusterSize := len(cm.peerIds) + 1
+					if votesReceived*2 > clusterSize {
 						cm.logger.Debug("wins election", "votes", votesReceived)
 						cm.startLeader()
 					}
@@ -835,9 +913,24 @@ func (cm *ConsensusModule) leaderSendAEs() {
 		return
 	}
 	savedCurrentTerm := cm.currentTerm
+	peers := append([]int(nil), cm.peerIds...)
+	// Also include any peers that have replication state but aren't yet in
+	// peerIds (i.e. a newly added node catching up before config commits).
+	for id := range cm.nextIndex {
+		found := false
+		for _, p := range peers {
+			if p == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			peers = append(peers, id)
+		}
+	}
 	cm.mu.Unlock()
 
-	for _, peerId := range cm.peerIds {
+	for _, peerId := range peers {
 		go func() {
 			cm.mu.Lock()
 			ni := cm.nextIndex[peerId]
@@ -910,6 +1003,7 @@ func (cm *ConsensusModule) leaderSendAEs() {
 								}
 								if matchCount*2 > len(cm.peerIds)+1 {
 									cm.commitIndex = i
+									cm.maybeApplyConfigAt(i)
 								}
 							}
 						}
@@ -996,6 +1090,48 @@ func (cm *ConsensusModule) sendInstallSnapshot(peerId, savedCurrentTerm int) {
 // Commit sender
 // ---------------------------------------------------------------------------
 
+// maybeApplyConfigAt checks whether the entry at globalIdx is a ConfigChange
+// and, if so, applies it to peerIds immediately.
+// MUST be called with cm.mu held.
+func (cm *ConsensusModule) maybeApplyConfigAt(globalIdx int) {
+	if globalIdx < cm.logOffset || globalIdx > cm.globalLastIndex() {
+		return
+	}
+	entry := cm.entryAt(globalIdx)
+	cc, ok := entry.Command.(ConfigChangeEntry)
+	if !ok {
+		return
+	}
+	if globalIdx == cm.pendingConfigIndex {
+		cm.pendingConfigIndex = -1
+	}
+	switch cc.Type {
+	case AddNode:
+		if cc.NodeId != cm.id {
+			for _, id := range cm.peerIds {
+				if id == cc.NodeId {
+					return
+				}
+			}
+			cm.peerIds = append(cm.peerIds, cc.NodeId)
+		}
+	case RemoveNode:
+		newPeers := cm.peerIds[:0:0]
+		for _, id := range cm.peerIds {
+			if id != cc.NodeId {
+				newPeers = append(newPeers, id)
+			}
+		}
+		cm.peerIds = newPeers
+		delete(cm.nextIndex, cc.NodeId)
+		delete(cm.matchIndex, cc.NodeId)
+		// Removed leader must step down.
+		if cc.NodeId == cm.id && cm.state == Leader {
+			cm.becomeFollower(cm.currentTerm)
+		}
+	}
+}
+
 func (cm *ConsensusModule) commitChanSender() {
 	defer cm.newCommitReadyChanWg.Done()
 
@@ -1024,9 +1160,15 @@ func (cm *ConsensusModule) commitChanSender() {
 		cm.logger.Debug("commitChanSender", "entries", entries, "savedLastApplied", savedLastApplied)
 
 		for i, entry := range entries {
+			globalIdx := savedLastApplied + i + 1
+			if _, ok := entry.Command.(ConfigChangeEntry); ok {
+				cm.mu.Lock()
+				cm.maybeApplyConfigAt(globalIdx)
+				cm.mu.Unlock()
+			}
 			cm.commitChan <- CommitEntry{
 				Command: entry.Command,
-				Index:   savedLastApplied + i + 1,
+				Index:   globalIdx,
 				Term:    entry.Term,
 			}
 		}

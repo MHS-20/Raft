@@ -269,31 +269,51 @@ func (h *Harness) CheckCommitted(cmd int) (nc int, index int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	// Find the length of the commits slice for connected servers.
-	commitsLen := -1
+	// Build per-server slices containing only integer (application) commands,
+	// filtering out ConfigChangeEntry values that also flow through the commit
+	// channel.  This keeps CheckCommitted working correctly in membership tests
+	// where config entries appear at different positions across servers.
+	type intCommit struct {
+		cmd   int
+		index int
+	}
+	appCommits := make([][]intCommit, h.n)
 	for i := 0; i < h.n; i++ {
 		if h.connected[i] {
-			if commitsLen >= 0 {
-				// If this was set already, expect the new length to be the same.
-				if len(h.commits[i]) != commitsLen {
-					h.t.Fatalf("commits[%d] = %d, commitsLen = %d", i, h.commits[i], commitsLen)
+			for _, e := range h.commits[i] {
+				if cmd, ok := e.Command.(int); ok {
+					appCommits[i] = append(appCommits[i], intCommit{cmd, e.Index})
 				}
-			} else {
-				commitsLen = len(h.commits[i])
 			}
 		}
 	}
 
-	// Check consistency of commits from the start and to the command we're asked
-	// about. This loop will return once a command=cmd is found.
-	for c := 0; c < commitsLen; c++ {
+	// All connected servers must have committed the same number of integer
+	// entries in the same order up to the point where cmd appears.
+	appLen := -1
+	for i := 0; i < h.n; i++ {
+		if h.connected[i] {
+			if appLen >= 0 {
+				if len(appCommits[i]) != appLen {
+					h.t.Fatalf("app-command commit length mismatch: server %d has %d, expected %d",
+						i, len(appCommits[i]), appLen)
+				}
+			} else {
+				appLen = len(appCommits[i])
+			}
+		}
+	}
+
+	// Walk the filtered log looking for cmd, checking consistency as we go.
+	for c := 0; c < appLen; c++ {
 		cmdAtC := -1
 		for i := 0; i < h.n; i++ {
 			if h.connected[i] {
-				cmdOfN := h.commits[i][c].Command.(int)
+				cmdOfN := appCommits[i][c].cmd
 				if cmdAtC >= 0 {
 					if cmdOfN != cmdAtC {
-						h.t.Errorf("got %d, want %d at h.commits[%d][%d]", cmdOfN, cmdAtC, i, c)
+						h.t.Errorf("app-commit mismatch at position %d: server %d has %d, want %d",
+							c, i, cmdOfN, cmdAtC)
 					}
 				} else {
 					cmdAtC = cmdOfN
@@ -301,15 +321,17 @@ func (h *Harness) CheckCommitted(cmd int) (nc int, index int) {
 			}
 		}
 		if cmdAtC == cmd {
-			// Check consistency of Index.
+			// Verify all connected servers agree on the global index.
 			index := -1
 			nc := 0
 			for i := 0; i < h.n; i++ {
 				if h.connected[i] {
-					if index >= 0 && h.commits[i][c].Index != index {
-						h.t.Errorf("got Index=%d, want %d at h.commits[%d][%d]", h.commits[i][c].Index, index, i, c)
+					idx := appCommits[i][c].index
+					if index >= 0 && idx != index {
+						h.t.Errorf("index mismatch for cmd=%d: server %d has index %d, want %d",
+							cmd, i, idx, index)
 					} else {
-						index = h.commits[i][c].Index
+						index = idx
 					}
 					nc++
 				}
@@ -318,8 +340,7 @@ func (h *Harness) CheckCommitted(cmd int) (nc int, index int) {
 		}
 	}
 
-	// If there's no early return, we haven't found the command we were looking
-	// for.
+	// cmd not found in any connected server's filtered commit log.
 	h.t.Errorf("cmd=%d not found in commits", cmd)
 	return -1, -1
 }
@@ -334,6 +355,17 @@ func (h *Harness) CheckCommittedN(cmd int, n int) {
 	}
 }
 
+// CheckCommittedAtLeastN verifies that cmd was committed by at least n
+// connected servers.  Use this when a newly-joined server may have replayed
+// historical entries, making the exact count uncertain.
+func (h *Harness) CheckCommittedAtLeastN(cmd int, n int) {
+	h.t.Helper()
+	nc, _ := h.CheckCommitted(cmd)
+	if nc < n {
+		h.t.Errorf("CheckCommittedAtLeastN got nc=%d, want >= %d", nc, n)
+	}
+}
+
 // CheckNotCommitted verifies that no command equal to cmd has been committed
 // by any of the active servers yet.
 func (h *Harness) CheckNotCommitted(cmd int) {
@@ -344,7 +376,10 @@ func (h *Harness) CheckNotCommitted(cmd int) {
 	for i := 0; i < h.n; i++ {
 		if h.connected[i] {
 			for c := 0; c < len(h.commits[i]); c++ {
-				gotCmd := h.commits[i][c].Command.(int)
+				gotCmd, ok := h.commits[i][c].Command.(int)
+				if !ok {
+					continue // skip ConfigChangeEntry and other non-int commands
+				}
 				if gotCmd == cmd {
 					h.t.Errorf("found %d at commits[%d][%d], expected none", cmd, i, c)
 				}
@@ -371,7 +406,14 @@ func sleepMs(n int) {
 // to the corresponding commits[i]. It's blocking and should be run in a
 // separate goroutine. It returns when commitChans[i] is closed.
 func (h *Harness) collectCommits(i int) {
-	for c := range h.commitChans[i] {
+	// Capture the channel under the lock so we never race with AddServerToCluster
+	// growing h.commitChans (append may reallocate the backing array, making a
+	// concurrent bare read of h.commitChans[i] a data race).
+	h.mu.Lock()
+	ch := h.commitChans[i]
+	h.mu.Unlock()
+
+	for c := range ch {
 		h.mu.Lock()
 		tlog("collectCommits(%d) got %+v", i, c)
 		h.commits[i] = append(h.commits[i], c)
@@ -455,7 +497,11 @@ func (h *Harness) CheckCommittedIgnoringSnapshot(cmd int) (nc int, index int) {
 			continue
 		}
 		for _, entry := range h.commits[i] {
-			if entry.Command.(int) == cmd {
+			intCmd, ok := entry.Command.(int)
+			if !ok {
+				continue // skip ConfigChangeEntry and other non-int commands
+			}
+			if intCmd == cmd {
 				if index >= 0 && entry.Index != index {
 					h.t.Errorf("server %d committed cmd=%d at index=%d, want index=%d",
 						i, cmd, entry.Index, index)
