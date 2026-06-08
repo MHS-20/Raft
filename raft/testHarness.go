@@ -2,14 +2,12 @@ package raft
 
 import (
 	"log"
+	"log/slog"
+	"os"
 	"sync"
 	"testing"
 	"time"
 )
-
-func init() {
-	log.SetFlags(log.Ltime | log.Lmicroseconds)
-}
 
 type Harness struct {
 	mu sync.Mutex
@@ -37,8 +35,9 @@ type Harness struct {
 	// connected implies alive.
 	alive []bool
 
-	n int
-	t *testing.T
+	n      int
+	t      *testing.T
+	logger *slog.Logger
 }
 
 // NewHarness creates a new test Harness, initialized with n servers connected
@@ -51,6 +50,7 @@ func NewHarness(t *testing.T, n int) *Harness {
 	commits := make([][]CommitEntry, n)
 	ready := make(chan any)
 	storage := make([]*MapStorage, n)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	// Create all Servers in this cluster, assign ids and peer ids.
 	for i := 0; i < n; i++ {
@@ -63,7 +63,7 @@ func NewHarness(t *testing.T, n int) *Harness {
 
 		storage[i] = NewMapStorage()
 		commitChans[i] = make(chan CommitEntry)
-		ns[i] = NewServer(i, peerIds, storage[i], ready, commitChans[i])
+		ns[i] = NewServer(i, peerIds, storage[i], ready, commitChans[i], logger)
 		ns[i].Serve()
 		alive[i] = true
 	}
@@ -88,6 +88,7 @@ func NewHarness(t *testing.T, n int) *Harness {
 		alive:       alive,
 		n:           n,
 		t:           t,
+		logger:      logger,
 	}
 	for i := 0; i < n; i++ {
 		go h.collectCommits(i)
@@ -174,7 +175,7 @@ func (h *Harness) RestartPeer(id int) {
 	}
 
 	ready := make(chan any)
-	h.cluster[id] = NewServer(id, peerIds, h.storage[id], ready, h.commitChans[id])
+	h.cluster[id] = NewServer(id, peerIds, h.storage[id], ready, h.commitChans[id], h.logger)
 	h.cluster[id].Serve()
 	h.ReconnectPeer(id)
 	close(ready)

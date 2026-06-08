@@ -3,15 +3,12 @@ package raft
 import (
 	"bytes"
 	"encoding/gob"
-	"fmt"
-	"log"
+	"log/slog"
 	"math/rand"
 	"os"
 	"sync"
 	"time"
 )
-
-const DebugCM = 1
 
 // CommitEntry is the data reported by Raft to the commit channel
 type CommitEntry struct {
@@ -58,6 +55,7 @@ type ConsensusModule struct {
 	peerIds []int
 	server  *Server
 	storage Storage
+	logger  *slog.Logger
 
 	commitChan           chan<- CommitEntry
 	newCommitReadyChan   chan struct{}
@@ -80,12 +78,13 @@ type ConsensusModule struct {
 	matchIndex map[int]int
 }
 
-func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, ready <-chan any, commitChan chan<- CommitEntry) *ConsensusModule {
+func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, ready <-chan any, commitChan chan<- CommitEntry, logger *slog.Logger) *ConsensusModule {
 	cm := new(ConsensusModule)
 	cm.id = id
 	cm.peerIds = peerIds
 	cm.server = server
 	cm.storage = storage
+	cm.logger = logger.With("id", id)
 	cm.commitChan = commitChan
 	cm.newCommitReadyChan = make(chan struct{}, 16)
 	cm.triggerAEChan = make(chan struct{}, 1)
@@ -134,12 +133,12 @@ type SubmitResult struct {
 // Submit submits a new command to the CM. It returns a SubmitResult
 func (cm *ConsensusModule) Submit(command any) SubmitResult {
 	cm.mu.Lock()
-	cm.dlog("Submit received by %v: %v", cm.state, command)
+	cm.logger.Debug("Submit received", "state", cm.state, "command", command)
 	if cm.state == Leader {
 		submitIndex := len(cm.log)
 		cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
 		cm.persistToStorage()
-		cm.dlog("... log=%v", cm.log)
+		cm.logger.Debug("Submit accepted", "log", cm.log)
 		cm.mu.Unlock()
 		cm.triggerAEChan <- struct{}{}
 		return SubmitResult{Index: submitIndex, IsLeader: true, LeaderHint: cm.id}
@@ -154,11 +153,11 @@ func (cm *ConsensusModule) Submit(command any) SubmitResult {
 }
 
 func (cm *ConsensusModule) Stop() {
-	cm.dlog("CM.Stop called")
+	cm.logger.Debug("CM.Stop called")
 	cm.mu.Lock()
 	cm.state = Dead
 	cm.mu.Unlock()
-	cm.dlog("becomes Dead")
+	cm.logger.Debug("becomes Dead")
 	close(cm.newCommitReadyChan)
 	cm.newCommitReadyChanWg.Wait()
 }
@@ -168,26 +167,32 @@ func (cm *ConsensusModule) restoreFromStorage() {
 	if termData, found := cm.storage.Get("currentTerm"); found {
 		d := gob.NewDecoder(bytes.NewBuffer(termData))
 		if err := d.Decode(&cm.currentTerm); err != nil {
-			log.Fatal(err)
+			cm.logger.Error("failed to decode currentTerm", "err", err)
+			os.Exit(1)
 		}
 	} else {
-		log.Fatal("currentTerm not found in storage")
+		cm.logger.Error("currentTerm not found in storage")
+		os.Exit(1)
 	}
 	if votedData, found := cm.storage.Get("votedFor"); found {
 		d := gob.NewDecoder(bytes.NewBuffer(votedData))
 		if err := d.Decode(&cm.votedFor); err != nil {
-			log.Fatal(err)
+			cm.logger.Error("failed to decode votedFor", "err", err)
+			os.Exit(1)
 		}
 	} else {
-		log.Fatal("votedFor not found in storage")
+		cm.logger.Error("votedFor not found in storage")
+		os.Exit(1)
 	}
 	if logData, found := cm.storage.Get("log"); found {
 		d := gob.NewDecoder(bytes.NewBuffer(logData))
 		if err := d.Decode(&cm.log); err != nil {
-			log.Fatal(err)
+			cm.logger.Error("failed to decode log", "err", err)
+			os.Exit(1)
 		}
 	} else {
-		log.Fatal("log not found in storage")
+		cm.logger.Error("log not found in storage")
+		os.Exit(1)
 	}
 }
 
@@ -211,29 +216,24 @@ func (cm *ConsensusModule) persistIfChanged(before persistentState) {
 func (cm *ConsensusModule) persistToStorage() {
 	var termData bytes.Buffer
 	if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {
-		log.Fatal(err)
+		cm.logger.Error("failed to encode currentTerm", "err", err)
+		os.Exit(1)
 	}
 	cm.storage.Set("currentTerm", termData.Bytes())
 
 	var votedData bytes.Buffer
 	if err := gob.NewEncoder(&votedData).Encode(cm.votedFor); err != nil {
-		log.Fatal(err)
+		cm.logger.Error("failed to encode votedFor", "err", err)
+		os.Exit(1)
 	}
 	cm.storage.Set("votedFor", votedData.Bytes())
 
 	var logData bytes.Buffer
 	if err := gob.NewEncoder(&logData).Encode(cm.log); err != nil {
-		log.Fatal(err)
+		cm.logger.Error("failed to encode log", "err", err)
+		os.Exit(1)
 	}
 	cm.storage.Set("log", logData.Bytes())
-}
-
-// debug log
-func (cm *ConsensusModule) dlog(format string, args ...any) {
-	if DebugCM > 0 {
-		format = fmt.Sprintf("[%d] ", cm.id) + format
-		log.Printf(format, args...)
-	}
 }
 
 type RequestVoteArgs struct {
@@ -255,12 +255,12 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 		return nil
 	}
 	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
-	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d, log index/term=(%d, %d)]", args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm)
+	cm.logger.Debug("RequestVote", "args", args, "currentTerm", cm.currentTerm, "votedFor", cm.votedFor, "lastLogIndex", lastLogIndex, "lastLogTerm", lastLogTerm)
 
 	before := cm.captureState()
 
 	if args.Term > cm.currentTerm {
-		cm.dlog("... term out of date in RequestVote")
+		cm.logger.Debug("term out of date in RequestVote")
 		cm.becomeFollower(args.Term)
 	}
 
@@ -276,7 +276,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	}
 	reply.Term = cm.currentTerm
 	cm.persistIfChanged(before)
-	cm.dlog("... RequestVote reply: %+v", reply)
+	cm.logger.Debug("RequestVote reply", "reply", reply)
 	return nil
 }
 
@@ -305,12 +305,12 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	if cm.state == Dead {
 		return nil
 	}
-	cm.dlog("AppendEntries: %+v", args)
+	cm.logger.Debug("AppendEntries", "args", args)
 
 	before := cm.captureState()
 
 	if args.Term > cm.currentTerm {
-		cm.dlog("... term out of date in AppendEntries")
+		cm.logger.Debug("term out of date in AppendEntries")
 		cm.becomeFollower(args.Term)
 	}
 
@@ -340,14 +340,14 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			}
 
 			if newEntriesIndex < len(args.Entries) {
-				cm.dlog("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
+				cm.logger.Debug("inserting entries", "entries", args.Entries[newEntriesIndex:], "fromIndex", logInsertIndex)
 				cm.log = append(cm.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
-				cm.dlog("... log is now: %v", cm.log)
+				cm.logger.Debug("log is now", "log", cm.log)
 			}
 
 			if args.LeaderCommit > cm.commitIndex {
 				cm.commitIndex = min(args.LeaderCommit, len(cm.log)-1)
-				cm.dlog("... setting commitIndex=%d", cm.commitIndex)
+				cm.logger.Debug("setting commitIndex", "commitIndex", cm.commitIndex)
 				cm.newCommitReadyChan <- struct{}{}
 			}
 		} else {
@@ -370,7 +370,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 
 	reply.Term = cm.currentTerm
 	cm.persistIfChanged(before)
-	cm.dlog("AppendEntries reply: %+v", *reply)
+	cm.logger.Debug("AppendEntries reply", "reply", *reply)
 	return nil
 }
 
@@ -388,7 +388,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 	cm.mu.Lock()
 	termStarted := cm.currentTerm
 	cm.mu.Unlock()
-	cm.dlog("election timer started (%v), term=%d", timeoutDuration, termStarted)
+	cm.logger.Debug("election timer started", "timeout", timeoutDuration, "term", termStarted)
 
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -397,13 +397,13 @@ func (cm *ConsensusModule) runElectionTimer() {
 
 		cm.mu.Lock()
 		if cm.state != Candidate && cm.state != Follower {
-			cm.dlog("in election timer state=%s, bailing out", cm.state)
+			cm.logger.Debug("election timer bailing out", "state", cm.state)
 			cm.mu.Unlock()
 			return
 		}
 
 		if termStarted != cm.currentTerm {
-			cm.dlog("in election timer term changed from %d to %d, bailing out", termStarted, cm.currentTerm)
+			cm.logger.Debug("election timer term changed, bailing out", "from", termStarted, "to", cm.currentTerm)
 			cm.mu.Unlock()
 			return
 		}
@@ -426,7 +426,7 @@ func (cm *ConsensusModule) startElection() {
 	cm.electionResetEvent = time.Now()
 	cm.votedFor = cm.id
 	cm.persistToStorage()
-	cm.dlog("becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
+	cm.logger.Debug("becomes Candidate", "currentTerm", savedCurrentTerm, "log", cm.log)
 
 	votesReceived := 1
 
@@ -444,20 +444,20 @@ func (cm *ConsensusModule) startElection() {
 				LastLogTerm:  savedLastLogTerm,
 			}
 
-			cm.dlog("sending RequestVote to %d: %+v", peerId, args)
+			cm.logger.Debug("sending RequestVote", "to", peerId, "args", args)
 			var reply RequestVoteReply
 			if err := cm.server.Call(peerId, "ConsensusModule.RequestVote", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
-				cm.dlog("received RequestVoteReply %+v", reply)
+				cm.logger.Debug("received RequestVoteReply", "reply", reply)
 
 				if cm.state != Candidate {
-					cm.dlog("while waiting for reply, state = %v", cm.state)
+					cm.logger.Debug("while waiting for reply, state changed", "state", cm.state)
 					return
 				}
 
 				if reply.Term > cm.currentTerm {
-					cm.dlog("term out of date in RequestVoteReply")
+					cm.logger.Debug("term out of date in RequestVoteReply")
 					cm.becomeFollower(reply.Term)
 					return
 				} else if reply.Term == cm.currentTerm {
@@ -465,7 +465,7 @@ func (cm *ConsensusModule) startElection() {
 						votesReceived += 1
 						if votesReceived*2 > len(cm.peerIds)+1 {
 							// Won the election!
-							cm.dlog("wins election with %d votes", votesReceived)
+							cm.logger.Debug("wins election", "votes", votesReceived)
 							cm.startLeader()
 							return
 						}
@@ -480,7 +480,7 @@ func (cm *ConsensusModule) startElection() {
 }
 
 func (cm *ConsensusModule) becomeFollower(term int) {
-	cm.dlog("becomes Follower with term=%d; log=%v", term, cm.log)
+	cm.logger.Debug("becomes Follower", "term", term, "log", cm.log)
 	cm.state = Follower
 	if term > cm.currentTerm {
 		cm.currentTerm = term
@@ -498,7 +498,7 @@ func (cm *ConsensusModule) startLeader() {
 		cm.nextIndex[peerId] = len(cm.log)
 		cm.matchIndex[peerId] = -1
 	}
-	cm.dlog("becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v", cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log)
+	cm.logger.Debug("becomes Leader", "term", cm.currentTerm, "nextIndex", cm.nextIndex, "matchIndex", cm.matchIndex, "log", cm.log)
 
 	go func(heartbeatTimeout time.Duration) {
 		// Immediately send AEs to peers.
@@ -573,12 +573,12 @@ func (cm *ConsensusModule) leaderSendAEs() {
 				LeaderCommit: cm.commitIndex,
 			}
 			cm.mu.Unlock()
-			cm.dlog("sending AppendEntries to %v: ni=%d, args=%+v", peerId, ni, args)
+			cm.logger.Debug("sending AppendEntries", "to", peerId, "ni", ni, "args", args)
 			var reply AppendEntriesReply
 			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 				cm.mu.Lock()
 				if reply.Term > cm.currentTerm {
-					cm.dlog("term out of date in heartbeat reply")
+					cm.logger.Debug("term out of date in heartbeat reply")
 					cm.becomeFollower(reply.Term)
 					cm.mu.Unlock()
 					return
@@ -603,9 +603,9 @@ func (cm *ConsensusModule) leaderSendAEs() {
 								}
 							}
 						}
-						cm.dlog("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v; commitIndex := %d", peerId, cm.nextIndex, cm.matchIndex, cm.commitIndex)
+						cm.logger.Debug("AppendEntries reply success", "from", peerId, "nextIndex", cm.nextIndex, "matchIndex", cm.matchIndex, "commitIndex", cm.commitIndex)
 						if cm.commitIndex != savedCommitIndex {
-							cm.dlog("leader sets commitIndex := %d", cm.commitIndex)
+							cm.logger.Debug("leader sets commitIndex", "commitIndex", cm.commitIndex)
 							cm.mu.Unlock()
 							cm.newCommitReadyChan <- struct{}{}
 							cm.triggerAEChan <- struct{}{}
@@ -629,7 +629,7 @@ func (cm *ConsensusModule) leaderSendAEs() {
 						} else {
 							cm.nextIndex[peerId] = reply.ConflictIndex
 						}
-						cm.dlog("AppendEntries reply from %d !success: nextIndex := %d", peerId, ni-1)
+						cm.logger.Debug("AppendEntries reply !success", "from", peerId, "nextIndex", ni-1)
 						cm.mu.Unlock()
 					}
 				} else {
@@ -662,10 +662,10 @@ func (cm *ConsensusModule) commitChanSender() {
 			cm.lastApplied = cm.commitIndex
 		}
 		cm.mu.Unlock()
-		cm.dlog("commitChanSender entries=%v, savedLastApplied=%d", entries, savedLastApplied)
+		cm.logger.Debug("commitChanSender", "entries", entries, "savedLastApplied", savedLastApplied)
 
 		for i, entry := range entries {
-			cm.dlog("send on commitchan i=%v, entry=%v", i, entry)
+			cm.logger.Debug("send on commitchan", "i", i, "entry", entry)
 			cm.commitChan <- CommitEntry{
 				Command: entry.Command,
 				Index:   savedLastApplied + i + 1,
@@ -673,5 +673,5 @@ func (cm *ConsensusModule) commitChanSender() {
 			}
 		}
 	}
-	cm.dlog("commitChanSender done")
+	cm.logger.Debug("commitChanSender done")
 }

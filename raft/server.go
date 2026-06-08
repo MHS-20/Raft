@@ -3,6 +3,7 @@ package raft
 import (
 	"fmt"
 	"log"
+	"log/slog"
 	"math/rand"
 	"net"
 	"net/rpc"
@@ -27,12 +28,13 @@ type Server struct {
 	commitChan  chan<- CommitEntry
 	peerClients map[int]*rpc.Client
 
-	ready <-chan any
-	quit  chan any
-	wg    sync.WaitGroup
+	ready  <-chan any
+	quit   chan any
+	wg     sync.WaitGroup
+	logger *slog.Logger
 }
 
-func NewServer(serverId int, peerIds []int, storage Storage, ready <-chan any, commitChan chan<- CommitEntry) *Server {
+func NewServer(serverId int, peerIds []int, storage Storage, ready <-chan any, commitChan chan<- CommitEntry, logger *slog.Logger) *Server {
 	s := new(Server)
 	s.serverId = serverId
 	s.peerIds = peerIds
@@ -41,12 +43,13 @@ func NewServer(serverId int, peerIds []int, storage Storage, ready <-chan any, c
 	s.ready = ready
 	s.commitChan = commitChan
 	s.quit = make(chan any)
+	s.logger = logger.With("serverId", serverId)
 	return s
 }
 
 func (s *Server) Serve() {
 	s.mu.Lock()
-	s.cm = NewConsensusModule(s.serverId, s.peerIds, s, s.storage, s.ready, s.commitChan)
+	s.cm = NewConsensusModule(s.serverId, s.peerIds, s, s.storage, s.ready, s.commitChan, s.logger)
 
 	s.rpcServer = rpc.NewServer()
 	s.rpcProxy = NewProxy(s.cm)
@@ -57,7 +60,7 @@ func (s *Server) Serve() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("[%v] listening at %s", s.serverId, s.listener.Addr())
+	s.logger.Info("listening", "addr", s.listener.Addr())
 	s.mu.Unlock()
 
 	s.wg.Add(1)
@@ -179,10 +182,10 @@ func (rpp *RPCProxy) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) 
 		dice := rand.Intn(10)
 		switch dice {
 		case 9:
-			rpp.cm.dlog("drop RequestVote")
+			rpp.cm.logger.Debug("drop RequestVote")
 			return fmt.Errorf("RPC failed")
 		case 8:
-			rpp.cm.dlog("delay RequestVote")
+			rpp.cm.logger.Debug("delay RequestVote")
 			time.Sleep(75 * time.Millisecond)
 		}
 	} else {
@@ -196,10 +199,10 @@ func (rpp *RPCProxy) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesR
 		dice := rand.Intn(10)
 		switch dice {
 		case 9:
-			rpp.cm.dlog("drop AppendEntries")
+			rpp.cm.logger.Debug("drop AppendEntries")
 			return fmt.Errorf("RPC failed")
 		case 8:
-			rpp.cm.dlog("delay AppendEntries")
+			rpp.cm.logger.Debug("delay AppendEntries")
 			time.Sleep(75 * time.Millisecond)
 		}
 	} else {
@@ -212,7 +215,7 @@ func (rpp *RPCProxy) Call(peer *rpc.Client, method string, args any, reply any) 
 	rpp.mu.Lock()
 	if rpp.numCallsBeforeDrop == 0 {
 		rpp.mu.Unlock()
-		rpp.cm.dlog("drop Call %s: %v", method, args)
+		rpp.cm.logger.Debug("drop Call", "method", method, "args", args)
 		return fmt.Errorf("RPC failed")
 	} else {
 		if rpp.numCallsBeforeDrop > 0 {
