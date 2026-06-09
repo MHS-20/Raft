@@ -1153,17 +1153,38 @@ func (cm *ConsensusModule) sendFinalHeartbeat(term, leaderCommit int) {
 	peers := append([]int(nil), cm.peerIds...)
 	for _, pid := range peers {
 		pid := pid
+		ni := cm.nextIndex[pid]
+		lastIdx := cm.globalLastIndex()
+		var entries []LogEntry
+		prevLogIndex := -1
+		prevLogTerm := -1
+		if ni <= lastIdx {
+			localFrom := cm.localIndex(ni)
+			entries = make([]LogEntry, len(cm.log)-localFrom)
+			copy(entries, cm.log[localFrom:])
+			prevLogIndex = ni - 1
+			if prevLogIndex >= cm.logOffset {
+				prevLogTerm = cm.entryAt(prevLogIndex).Term
+			}
+		}
+		ents := entries
 		go func() {
 			args := AppendEntriesArgs{
 				Term:         term,
 				LeaderId:     cm.id,
-				PrevLogIndex: -1,
-				PrevLogTerm:  -1,
-				Entries:      nil,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      ents,
 				LeaderCommit: leaderCommit,
 			}
-			var reply AppendEntriesReply
-			cm.server.Call(pid, "ConsensusModule.AppendEntries", args, &reply)
+			// Retry up to 10 times under unreliable RPC (10 % drop rate means
+			// the probability of 10 consecutive drops is 1e-10).
+			for i := 0; i < 10; i++ {
+				var reply AppendEntriesReply
+				if err := cm.server.Call(pid, "ConsensusModule.AppendEntries", args, &reply); err == nil {
+					return
+				}
+			}
 		}()
 	}
 }

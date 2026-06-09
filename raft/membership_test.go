@@ -281,30 +281,42 @@ func TestRemoveLeader(t *testing.T) {
 	// Ask the leader to remove itself.
 	h.RemoveServerFromCluster(origLeaderId, origLeaderId)
 
-	// Allow time for the config entry to commit and a new election.
-	sleepMs(600)
-
-	// A new leader must exist and it must not be the removed node.
-	newLeaderId, _ := h.CheckSingleLeader()
-	if newLeaderId == origLeaderId {
-		t.Errorf("removed leader %d is still the leader", origLeaderId)
-	}
-
-	// The removed node must not be in the peer lists of the survivors.
-	for i := 0; i < 3; i++ {
-		if i == origLeaderId {
+	// Wait for the config entry to commit and a new leader to emerge, polling
+	// the peer lists so we aren't sensitive to election timing (especially
+	// under RAFT_FORCE_MORE_REELECTION).
+	var newLeaderId int
+	for range 20 {
+		sleepMs(100)
+		newLeaderId, _ = h.CheckSingleLeader()
+		if newLeaderId == origLeaderId {
 			continue
 		}
-		h.cluster[i].cm.mu.Lock()
-		peers := append([]int(nil), h.cluster[i].cm.peerIds...)
-		h.cluster[i].cm.mu.Unlock()
-		for _, p := range peers {
-			if p == origLeaderId {
-				t.Errorf("server %d still has removed leader %d in its peerIds", i, origLeaderId)
+		// Check whether the survivors have removed the old leader from their peerIds.
+		allClean := true
+		for i := 0; i < 3; i++ {
+			if i == origLeaderId {
+				continue
+			}
+			h.cluster[i].cm.mu.Lock()
+			peers := append([]int(nil), h.cluster[i].cm.peerIds...)
+			h.cluster[i].cm.mu.Unlock()
+			for _, p := range peers {
+				if p == origLeaderId {
+					allClean = false
+					break
+				}
+			}
+			if !allClean {
+				break
 			}
 		}
+		if allClean {
+			goto done
+		}
 	}
+	t.Fatal("timeout waiting for survivors to remove leader from peerIds")
 
+done:
 	// Consensus must still work.
 	h.SubmitToServer(newLeaderId, 3002)
 	sleepMs(250)
