@@ -614,7 +614,7 @@ func TestCrashAfterSubmit(t *testing.T) {
 	// committed on all servers — the important thing is that after submitting
 	// 6 all servers have both entries committed.
 	h.SubmitToServer(newLeaderId, 6)
-	sleepMs(100)
+	h.WaitForStableCommits(2)
 	h.CheckCommittedN(5, 3)
 	h.CheckCommittedN(6, 3)
 }
@@ -645,7 +645,7 @@ func TestDisconnectAfterSubmit(t *testing.T) {
 	// committed on all servers — the important thing is that after submitting
 	// 6 all servers have both entries committed.
 	h.SubmitToServer(newLeaderId, 6)
-	sleepMs(100)
+	h.WaitForStableCommits(2)
 	h.CheckCommittedN(5, 3)
 	h.CheckCommittedN(6, 3)
 }

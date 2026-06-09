@@ -83,8 +83,8 @@ type ConsensusModule struct {
 	// Cluster membership: pendingConfigIndex != -1 while a ConfigChange
 	// log entry has been appended but not yet committed.
 	pendingConfigIndex int
-	storage Storage
-	logger  *slog.Logger
+	storage            Storage
+	logger             *slog.Logger
 
 	commitChan           chan<- CommitEntry
 	newCommitReadyChan   chan struct{}
@@ -1177,14 +1177,8 @@ func (cm *ConsensusModule) sendFinalHeartbeat(term, leaderCommit int) {
 				Entries:      ents,
 				LeaderCommit: leaderCommit,
 			}
-			// Retry up to 10 times under unreliable RPC (10 % drop rate means
-			// the probability of 10 consecutive drops is 1e-10).
-			for i := 0; i < 10; i++ {
-				var reply AppendEntriesReply
-				if err := cm.server.Call(pid, "ConsensusModule.AppendEntries", args, &reply); err == nil {
-					return
-				}
-			}
+			var reply AppendEntriesReply
+			cm.server.Call(pid, "ConsensusModule.AppendEntries", args, &reply)
 		}()
 	}
 }

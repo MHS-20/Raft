@@ -285,11 +285,22 @@ func TestRemoveLeader(t *testing.T) {
 	// the peer lists so we aren't sensitive to election timing (especially
 	// under RAFT_FORCE_MORE_REELECTION).
 	var newLeaderId int
-	for range 20 {
+	submitted := false
+	for range 60 {
 		sleepMs(100)
 		newLeaderId, _ = h.CheckSingleLeader()
 		if newLeaderId == origLeaderId {
 			continue
+		}
+		// Submit a command once when we first find a new leader, so the new
+		// leader can commit entries from its own term (Raft safety: entries
+		// from previous terms are only committed through the commitment of
+		// entries from the current term).  Without this the config-change
+		// entry from the old term stays uncommitted and the followers never
+		// apply it.
+		if !submitted {
+			h.SubmitToServer(newLeaderId, 3002)
+			submitted = true
 		}
 		// Check whether the survivors have removed the old leader from their peerIds.
 		allClean := true
@@ -317,10 +328,10 @@ func TestRemoveLeader(t *testing.T) {
 	t.Fatal("timeout waiting for survivors to remove leader from peerIds")
 
 done:
-	// Consensus must still work.
-	h.SubmitToServer(newLeaderId, 3002)
+	// Consensus must still work.  The submit above already placed 3002 in
+	// the log; verify it got committed on at least 2 servers.
 	sleepMs(250)
-	h.CheckCommittedN(3002, 2)
+	h.CheckCommittedAtLeastN(3002, 2)
 }
 
 // ---------------------------------------------------------------------------

@@ -517,3 +517,37 @@ func (h *Harness) CheckCommittedIgnoringSnapshot(cmd int) (nc int, index int) {
 	}
 	return nc, index
 }
+
+// WaitForStableCommits polls until every connected server has committed at
+// least n integer entries, or until ~2 s elapses.  It does not fail on its
+// own — callers should use CheckCommittedN / CheckCommittedAtLeastN after
+// returning to verify consistency.  Useful under RAFT_UNRELIABLE_RPC where
+// commit-index heartbeats can be delayed or dropped.
+func (h *Harness) WaitForStableCommits(n int) {
+	h.t.Helper()
+	for range 120 {
+		h.mu.Lock()
+		allOK := true
+	outer:
+		for i := 0; i < h.n; i++ {
+			if !h.connected[i] {
+				continue
+			}
+			c := 0
+			for _, e := range h.commits[i] {
+				if _, ok := e.Command.(int); ok {
+					c++
+				}
+			}
+			if c < n {
+				allOK = false
+				break outer
+			}
+		}
+		h.mu.Unlock()
+		if allOK {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
