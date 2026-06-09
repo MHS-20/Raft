@@ -121,6 +121,7 @@ type ConsensusModule struct {
 	lastApplied        int
 	state              CMState
 	electionResetEvent time.Time
+	removedSelf        bool // true when leader removes itself; skip elections
 
 	// Volatile Raft state on leaders
 	nextIndex  map[int]int
@@ -159,6 +160,16 @@ func (cm *ConsensusModule) entryAt(globalIdx int) LogEntry {
 
 // lastLogIndexAndTerm returns the global index and term of the last entry.
 // If the log is empty but a snapshot exists, returns the snapshot metadata.
+// peerContains returns true if the given server id is in our peer list.
+func (cm *ConsensusModule) peerContains(id int) bool {
+	for _, pid := range cm.peerIds {
+		if pid == id {
+			return true
+		}
+	}
+	return false
+}
+
 func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
 	if len(cm.log) > 0 {
 		last := cm.globalLastIndex()
@@ -242,6 +253,13 @@ func (cm *ConsensusModule) Submit(command any) SubmitResult {
 		cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
 		cm.persistToStorage()
 		cm.logger.Debug("Submit accepted", "submitIndex", submitIndex)
+		// Single-node cluster: commit immediately (no peers to replicate to).
+		if len(cm.peerIds) == 0 {
+			cm.commitIndex = submitIndex
+			cm.mu.Unlock()
+			cm.newCommitReadyChan <- struct{}{}
+			return SubmitResult{Index: submitIndex, IsLeader: true, LeaderHint: cm.id}
+		}
 		cm.mu.Unlock()
 		cm.triggerAEChan <- struct{}{}
 		return SubmitResult{Index: submitIndex, IsLeader: true, LeaderHint: cm.id}
@@ -471,6 +489,26 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	cm.logger.Debug("RequestVote", "args", args, "currentTerm", cm.currentTerm,
 		"votedFor", cm.votedFor, "lastLogIndex", lastLogIndex, "lastLogTerm", lastLogTerm)
 
+	// Raft membership safety: reject RequestVote from candidates not in our
+	// current configuration BEFORE updating our term.  This prevents a
+	// removed (or not-yet-added) server from disrupting the cluster by
+	// bumping everyone's term with spurious elections.
+	isPeer := args.CandidateId == cm.id
+	if !isPeer {
+		for _, pid := range cm.peerIds {
+			if pid == args.CandidateId {
+				isPeer = true
+				break
+			}
+		}
+	}
+	if !isPeer {
+		reply.Term = cm.currentTerm
+		reply.VoteGranted = false
+		cm.logger.Debug("RequestVote denied: candidate not a peer", "candidateId", args.CandidateId)
+		return nil
+	}
+
 	before := cm.captureState()
 
 	if args.Term > cm.currentTerm {
@@ -538,6 +576,14 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			cm.becomeFollower(args.Term)
 		}
 		cm.electionResetEvent = time.Now()
+
+		// If this server has been removed from the cluster via a committed
+		// config change, ignore all AEs — there is no leader we should
+		// follow.
+		if cm.removedSelf {
+			cm.logger.Debug("AppendEntries denied: server removed itself", "leaderId", args.LeaderId)
+			return nil
+		}
 
 		// ---- consistency check ------------------------------------------------
 		// Three cases for PrevLogIndex relative to our snapshot boundary:
@@ -787,6 +833,11 @@ func (cm *ConsensusModule) runElectionTimer() {
 }
 
 func (cm *ConsensusModule) startElection() {
+	if cm.removedSelf {
+		cm.state = Follower
+		cm.logger.Debug("skipping election; node removed from cluster")
+		return
+	}
 	cm.state = Candidate
 	cm.currentTerm++
 	savedCurrentTerm := cm.currentTerm
@@ -835,6 +886,13 @@ func (cm *ConsensusModule) startElection() {
 				}
 			}
 		}()
+	}
+
+	// Check for immediate majority (single-node cluster).
+	clusterSize := len(cm.peerIds) + 1
+	if votesReceived*2 > clusterSize {
+		cm.startLeader()
+		return
 	}
 
 	go cm.runElectionTimer()
@@ -928,6 +986,7 @@ func (cm *ConsensusModule) leaderSendAEs() {
 			peers = append(peers, id)
 		}
 	}
+
 	cm.mu.Unlock()
 
 	for _, peerId := range peers {
@@ -1086,6 +1145,29 @@ func (cm *ConsensusModule) sendInstallSnapshot(peerId, savedCurrentTerm int) {
 	}
 }
 
+// sendFinalHeartbeat sends an AppendEntries heartbeat to every remaining peer
+// with the given LeaderCommit, so they can advance their commitIndex before
+// this server relinquishes leadership.  It is called with cm.mu held and
+// MUST NOT acquire the lock itself.
+func (cm *ConsensusModule) sendFinalHeartbeat(term, leaderCommit int) {
+	peers := append([]int(nil), cm.peerIds...)
+	for _, pid := range peers {
+		pid := pid
+		go func() {
+			args := AppendEntriesArgs{
+				Term:         term,
+				LeaderId:     cm.id,
+				PrevLogIndex: -1,
+				PrevLogTerm:  -1,
+				Entries:      nil,
+				LeaderCommit: leaderCommit,
+			}
+			var reply AppendEntriesReply
+			cm.server.Call(pid, "ConsensusModule.AppendEntries", args, &reply)
+		}()
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Commit sender
 // ---------------------------------------------------------------------------
@@ -1116,6 +1198,14 @@ func (cm *ConsensusModule) maybeApplyConfigAt(globalIdx int) {
 			cm.peerIds = append(cm.peerIds, cc.NodeId)
 		}
 	case RemoveNode:
+		// If the leader is removing another node, send one final
+		// heartbeat so the removed node learns about the commitIndex
+		// (and applies the config change) before it stops receiving
+		// heartbeats and starts a disruptive election.  The heartbeat
+		// is sent before peerIds is trimmed so the target is included.
+		if cc.NodeId != cm.id && cm.state == Leader {
+			cm.sendFinalHeartbeat(cm.currentTerm, cm.commitIndex)
+		}
 		newPeers := cm.peerIds[:0:0]
 		for _, id := range cm.peerIds {
 			if id != cc.NodeId {
@@ -1126,7 +1216,14 @@ func (cm *ConsensusModule) maybeApplyConfigAt(globalIdx int) {
 		delete(cm.nextIndex, cc.NodeId)
 		delete(cm.matchIndex, cc.NodeId)
 		// Removed leader must step down.
+		if cc.NodeId == cm.id {
+			cm.removedSelf = true
+		}
 		if cc.NodeId == cm.id && cm.state == Leader {
+			// Send one final heartbeat to every remaining peer so they
+			// learn about the commitIndex (and apply the config change)
+			// before the old leader disappears / starts an election.
+			cm.sendFinalHeartbeat(cm.currentTerm, cm.commitIndex)
 			cm.becomeFollower(cm.currentTerm)
 		}
 	}

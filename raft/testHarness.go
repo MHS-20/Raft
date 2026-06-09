@@ -212,7 +212,7 @@ func (h *Harness) PeerDropCallsAfterN(id int, n int) {
 
 // PeerDontDropCalls instructs peer `id` to stop dropping calls.
 func (h *Harness) PeerDontDropCalls(id int) {
-	tlog("peer %d don't drop calls")
+	tlog("peer %d don't drop calls", id)
 	h.cluster[id].Proxy().DontDropCalls()
 }
 

@@ -382,9 +382,9 @@ func TestAddThenRemoveServer(t *testing.T) {
 	sleepMs(400)
 
 	// Back to 3-node quorum.
-	h.CheckPeerList(0, peersExcept(newId+1, 0))
-	h.CheckPeerList(1, peersExcept(newId+1, 1))
-	h.CheckPeerList(2, peersExcept(newId+1, 2))
+	h.CheckPeerList(0, peersExcept(h.n-1, 0))
+	h.CheckPeerList(1, peersExcept(h.n-1, 1))
+	h.CheckPeerList(2, peersExcept(h.n-1, 2))
 
 	leaderId, _ = h.CheckSingleLeader()
 	h.SubmitToServer(leaderId, 5002)
@@ -485,6 +485,10 @@ func TestAddServerWhileFollowerPartitioned(t *testing.T) {
 	// Re-examine once we reconnect the partitioned peer.
 	h.ReconnectPeer(partitioned)
 	sleepMs(400)
+
+	// The previously-partitioned peer may have bumped its term while isolated,
+	// which can trigger a re-election when reconnected.  Re-acquire the leader.
+	leaderId, _ = h.CheckSingleLeader()
 
 	h.SubmitToServer(leaderId, 7001)
 	sleepMs(300)
