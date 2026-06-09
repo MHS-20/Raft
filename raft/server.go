@@ -168,6 +168,29 @@ func (s *Server) Proxy() *RPCProxy {
 	return s.rpcProxy
 }
 
+// InstallSnapshot tells the ConsensusModule to compact the log up to lastIndex
+// / lastTerm using the provided application snapshot data.  This is the
+// application-initiated path (as opposed to the leader-push path via
+// InstallSnapshotRPC).
+func (s *Server) InstallSnapshot(lastIndex, lastTerm int, data []byte) {
+	s.cm.InstallSnapshot(lastIndex, lastTerm, data)
+}
+
+// SnapshotReady returns the channel on which the ConsensusModule delivers
+// SnapshotEntry values when a snapshot is installed by the leader.  The
+// application must drain this channel and restore its state machine.
+func (s *Server) SnapshotReady() <-chan SnapshotEntry {
+	return s.cm.SnapshotReady()
+}
+
+// SnapshotDone returns a channel that is closed when this Server is shut down
+// via Shutdown().  It is the same channel that terminates the RPC accept loop,
+// so callers are guaranteed to observe the close at most once after Shutdown
+// returns.  Use it to terminate goroutines that drain SnapshotReady().
+func (s *Server) SnapshotDone() <-chan any {
+	return s.quit
+}
+
 type RPCProxy struct {
 	mu sync.Mutex
 	cm *ConsensusModule
