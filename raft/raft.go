@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"os"
+	"slices"
 	"sync"
 	"time"
 )
@@ -66,7 +67,6 @@ const (
 	RemoveNode
 )
 
-// ConfigChangeEntry is the Command stored in a ConfigChange log entry.
 type ConfigChangeEntry struct {
 	Type   ConfigChangeType
 	NodeId int
@@ -128,12 +128,6 @@ type ConsensusModule struct {
 	matchIndex map[int]int
 }
 
-// ---------------------------------------------------------------------------
-// Index arithmetic helpers
-// Every place that used to say cm.log[i] now goes through these helpers so
-// there is one canonical place to apply / remove the offset.
-// ---------------------------------------------------------------------------
-
 // logLen returns the number of entries currently in the trimmed log slice.
 func (cm *ConsensusModule) logLen() int { return len(cm.log) }
 
@@ -162,12 +156,7 @@ func (cm *ConsensusModule) entryAt(globalIdx int) LogEntry {
 // If the log is empty but a snapshot exists, returns the snapshot metadata.
 // peerContains returns true if the given server id is in our peer list.
 func (cm *ConsensusModule) peerContains(id int) bool {
-	for _, pid := range cm.peerIds {
-		if pid == id {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(cm.peerIds, id)
 }
 
 func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
@@ -278,16 +267,15 @@ func (cm *ConsensusModule) AddPeer(nodeId int) bool {
 		cm.mu.Unlock()
 		return false
 	}
-	for _, id := range cm.peerIds {
-		if id == nodeId {
-			cm.mu.Unlock()
-			return false // already a member
-		}
+	if slices.Contains(cm.peerIds, nodeId) {
+		cm.mu.Unlock()
+		return false // already a member
 	}
 	entry := ConfigChangeEntry{Type: AddNode, NodeId: nodeId}
 	submitIndex := cm.globalLastIndex() + 1
 	cm.log = append(cm.log, LogEntry{Command: entry, Term: cm.currentTerm})
 	cm.pendingConfigIndex = submitIndex
+
 	// Initialize replication state for the new peer now so AEs are sent.
 	cm.nextIndex[nodeId] = cm.globalLastIndex() + 1
 	cm.matchIndex[nodeId] = -1
@@ -304,13 +292,7 @@ func (cm *ConsensusModule) RemovePeer(nodeId int) bool {
 		cm.mu.Unlock()
 		return false
 	}
-	found := false
-	for _, id := range cm.peerIds {
-		if id == nodeId {
-			found = true
-			break
-		}
-	}
+	found := slices.Contains(cm.peerIds, nodeId)
 	if !found && nodeId != cm.id {
 		cm.mu.Unlock()
 		return false // not a member
@@ -328,8 +310,6 @@ func (cm *ConsensusModule) RemovePeer(nodeId int) bool {
 // InstallSnapshot is called by the application layer (or test harness) to
 // compact the log.  snapshotData is an opaque blob that fully encodes the
 // application state as of lastIndex/lastTerm.
-//
-// It is safe to call from any goroutine; it acquires cm.mu internally.
 func (cm *ConsensusModule) InstallSnapshot(lastIndex, lastTerm int, snapshotData []byte) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -495,11 +475,8 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	// bumping everyone's term with spurious elections.
 	isPeer := args.CandidateId == cm.id
 	if !isPeer {
-		for _, pid := range cm.peerIds {
-			if pid == args.CandidateId {
-				isPeer = true
-				break
-			}
+		if slices.Contains(cm.peerIds, args.CandidateId) {
+			isPeer = true
 		}
 	}
 	if !isPeer {
@@ -702,7 +679,7 @@ type InstallSnapshotReply struct {
 	Term int
 }
 
-// InstallSnapshot is the RPC handler called on a follower by the leader when
+// InstallSnapshotRPC is the RPC handler called on a follower by the leader when
 // the follower's nextIndex has fallen behind the leader's snapshot point.
 func (cm *ConsensusModule) InstallSnapshotRPC(args InstallSnapshotArgs, reply *InstallSnapshotReply) error {
 	cm.mu.Lock()
@@ -975,13 +952,7 @@ func (cm *ConsensusModule) leaderSendAEs() {
 	// Also include any peers that have replication state but aren't yet in
 	// peerIds (i.e. a newly added node catching up before config commits).
 	for id := range cm.nextIndex {
-		found := false
-		for _, p := range peers {
-			if p == id {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(peers, id)
 		if !found {
 			peers = append(peers, id)
 		}
@@ -994,10 +965,8 @@ func (cm *ConsensusModule) leaderSendAEs() {
 			cm.mu.Lock()
 			ni := cm.nextIndex[peerId]
 
-			// ----------------------------------------------------------------
 			// If nextIndex has fallen behind the snapshot point, send the
 			// snapshot instead of (potentially missing) log entries.
-			// ----------------------------------------------------------------
 			if ni <= cm.snapshotLastIndex {
 				cm.sendInstallSnapshot(peerId, savedCurrentTerm)
 				return // sendInstallSnapshot releases the lock
@@ -1152,7 +1121,6 @@ func (cm *ConsensusModule) sendInstallSnapshot(peerId, savedCurrentTerm int) {
 func (cm *ConsensusModule) sendFinalHeartbeat(term, leaderCommit int) {
 	peers := append([]int(nil), cm.peerIds...)
 	for _, pid := range peers {
-		pid := pid
 		ni := cm.nextIndex[pid]
 		lastIdx := cm.globalLastIndex()
 		var entries []LogEntry
@@ -1205,10 +1173,8 @@ func (cm *ConsensusModule) maybeApplyConfigAt(globalIdx int) {
 	switch cc.Type {
 	case AddNode:
 		if cc.NodeId != cm.id {
-			for _, id := range cm.peerIds {
-				if id == cc.NodeId {
-					return
-				}
+			if slices.Contains(cm.peerIds, cc.NodeId) {
+				return
 			}
 			cm.peerIds = append(cm.peerIds, cc.NodeId)
 		}
@@ -1255,10 +1221,7 @@ func (cm *ConsensusModule) commitChanSender() {
 			// Only entries that are still in the live log can be applied here.
 			// Entries covered by the snapshot were already reported via
 			// snapshotReadyChan when the snapshot was installed.
-			applyFrom := cm.lastApplied + 1
-			if applyFrom < cm.logOffset {
-				applyFrom = cm.logOffset
-			}
+			applyFrom := max(cm.lastApplied+1, cm.logOffset)
 			if applyFrom <= cm.commitIndex {
 				localFrom := cm.localIndex(applyFrom)
 				localTo := cm.localIndex(cm.commitIndex) + 1

@@ -53,11 +53,6 @@ func (ms *MapStorage) HasData() bool {
 // own file under a directory. Writes are atomic: data is first flushed to a
 // temp file in the same directory, then renamed over the target, so a crash
 // mid-write never leaves a partially-written value behind.
-//
-// Usage:
-//
-//	fs, err := NewFileStorage("/var/lib/raft/node-1")
-//	if err != nil { log.Fatal(err) }
 type FileStorage struct {
 	mu  sync.Mutex
 	dir string
@@ -66,7 +61,7 @@ type FileStorage struct {
 // NewFileStorage creates (or opens) a FileStorage rooted at dir.
 // The directory is created with 0700 permissions if it does not exist.
 func NewFileStorage(dir string) (*FileStorage, error) {
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("FileStorage: mkdir %q: %w", dir, err)
 	}
 	return &FileStorage{dir: dir}, nil
@@ -87,7 +82,7 @@ func (fs *FileStorage) Set(key string, value []byte) {
 	defer fs.mu.Unlock()
 
 	tmp := fs.tmpPath(key)
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		panic(fmt.Sprintf("FileStorage.Set: open tmp %q: %v", tmp, err))
 	}

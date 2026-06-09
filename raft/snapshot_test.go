@@ -80,7 +80,7 @@ func TestSnapshotBasic(t *testing.T) {
 
 	// No connected server should have received a snapshot via InstallSnapshotRPC
 	// (no follower was behind the snapshot boundary).
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		h.CheckNoSnapshotDelivered(i)
 	}
 }
@@ -359,7 +359,7 @@ func TestSnapshotDeliveredOnlyOnce(t *testing.T) {
 
 	// No follower should have received a snapshot via RPC because both followers
 	// already have nextIndex > snapshotLastIndex(3) — they were fully caught up.
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if i == leaderId {
 			continue
 		}
@@ -489,7 +489,7 @@ func TestSnapshotConcurrentSubmitAndCompact(t *testing.T) {
 	_, idx9 := h.CheckCommitted(9)
 	_, idx10 := h.CheckCommitted(10)
 
-	if !(idx7 < idx8 && idx8 < idx9 && idx9 < idx10) {
+	if idx7 >= idx8 || idx8 >= idx9 || idx9 >= idx10 {
 		t.Errorf("post-snapshot indices not monotone: %d %d %d %d", idx7, idx8, idx9, idx10)
 	}
 	if idx7 != 6 {
@@ -498,7 +498,7 @@ func TestSnapshotConcurrentSubmitAndCompact(t *testing.T) {
 
 	// No follower should have received a snapshot via RPC (all were up to date).
 	time.Sleep(100 * time.Millisecond)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if i == leaderId {
 			continue
 		}

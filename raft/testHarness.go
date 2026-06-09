@@ -59,9 +59,9 @@ func NewHarness(t *testing.T, n int) *Harness {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	// Create all Servers in this cluster, assign ids and peer ids.
-	for i := 0; i < n; i++ {
+	for i := range n {
 		peerIds := make([]int, 0)
-		for p := 0; p < n; p++ {
+		for p := range n {
 			if p != i {
 				peerIds = append(peerIds, p)
 			}
@@ -75,8 +75,8 @@ func NewHarness(t *testing.T, n int) *Harness {
 	}
 
 	// Connect all peers to each other.
-	for i := 0; i < n; i++ {
-		for j := 0; j < n; j++ {
+	for i := range n {
+		for j := range n {
 			if i != j {
 				ns[i].ConnectToPeer(j, ns[j].GetListenAddr())
 			}
@@ -97,7 +97,7 @@ func NewHarness(t *testing.T, n int) *Harness {
 		t:           t,
 		logger:      logger,
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		go h.collectCommits(i)
 		go h.collectSnapshots(i)
 	}
@@ -220,7 +220,7 @@ func (h *Harness) PeerDontDropCalls(id int) {
 // Returns the leader's id and term. It retries several times if no leader is
 // identified yet.
 func (h *Harness) CheckSingleLeader() (int, int) {
-	for r := 0; r < 8; r++ {
+	for range 8 {
 		leaderId := -1
 		leaderTerm := -1
 		for i := 0; i < h.n; i++ {

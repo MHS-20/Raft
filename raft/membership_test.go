@@ -1,13 +1,10 @@
 package raft
 
 import (
+	"slices"
 	"testing"
 	"time"
 )
-
-// ---------------------------------------------------------------------------
-// Harness extensions for membership changes
-// ---------------------------------------------------------------------------
 
 // AddServerToCluster spins up a brand-new server (id = h.n), connects it to
 // every currently-alive peer, and asks the leader to append an AddNode config
@@ -27,7 +24,7 @@ func (h *Harness) AddServerToCluster(leaderId int) int {
 	ready := make(chan any)
 
 	peerIds := make([]int, 0, newId)
-	for i := 0; i < newId; i++ {
+	for i := range newId {
 		peerIds = append(peerIds, i)
 	}
 
@@ -46,7 +43,7 @@ func (h *Harness) AddServerToCluster(leaderId int) int {
 	h.mu.Unlock()
 
 	// Wire the new server to all alive existing peers (bidirectional).
-	for j := 0; j < newId; j++ {
+	for j := range newId {
 		h.mu.Lock()
 		alive := h.alive[j]
 		h.mu.Unlock()
@@ -99,13 +96,7 @@ func (h *Harness) RemoveServerFromCluster(leaderId, targetId int) {
 		peers := append([]int(nil), h.cluster[leaderId].cm.peerIds...)
 		h.cluster[leaderId].cm.mu.Unlock()
 
-		found := false
-		for _, p := range peers {
-			if p == targetId {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(peers, targetId)
 		if !found {
 			break
 		}
@@ -304,18 +295,15 @@ func TestRemoveLeader(t *testing.T) {
 		}
 		// Check whether the survivors have removed the old leader from their peerIds.
 		allClean := true
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			if i == origLeaderId {
 				continue
 			}
 			h.cluster[i].cm.mu.Lock()
 			peers := append([]int(nil), h.cluster[i].cm.peerIds...)
 			h.cluster[i].cm.mu.Unlock()
-			for _, p := range peers {
-				if p == origLeaderId {
-					allClean = false
-					break
-				}
+			if slices.Contains(peers, origLeaderId) {
+				allClean = false
 			}
 			if !allClean {
 				break
@@ -791,11 +779,11 @@ func TestMembershipChangeConsistencyAcrossRestarts(t *testing.T) {
 	h.CheckPeerList(leaderId, peersExcept(newId+1, leaderId))
 
 	// Crash and restart each original server.
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		h.CrashPeer(i)
 	}
 	sleepMs(100)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		h.RestartPeer(i)
 	}
 	sleepMs(500)
@@ -819,7 +807,7 @@ func TestMembershipChangeConsistencyAcrossRestarts(t *testing.T) {
 // server excludeId is not included.
 func peersExcept(n, excludeId int) []int {
 	peers := make([]int, 0, n-1)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if i != excludeId {
 			peers = append(peers, i)
 		}

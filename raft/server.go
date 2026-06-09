@@ -63,10 +63,7 @@ func (s *Server) Serve() {
 	s.logger.Info("listening", "addr", s.listener.Addr())
 	s.mu.Unlock()
 
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-
+	s.wg.Go(func() {
 		for {
 			conn, err := s.listener.Accept()
 			if err != nil {
@@ -77,13 +74,11 @@ func (s *Server) Serve() {
 					log.Fatal("accept error:", err)
 				}
 			}
-			s.wg.Add(1)
-			go func() {
+			s.wg.Go(func() {
 				s.rpcServer.ServeConn(conn)
-				s.wg.Done()
-			}()
+			})
 		}
-	}()
+	})
 }
 
 func (s *Server) Submit(cmd any) SubmitResult {
