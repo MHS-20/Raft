@@ -55,8 +55,12 @@ func (s *Server) Serve() {
 	s.rpcProxy = NewProxy(s.cm)
 	s.rpcServer.RegisterName("ConsensusModule", s.rpcProxy)
 
+	listenAddr := os.Getenv("RAFT_LISTEN_ADDR")
+	if listenAddr == "" {
+		listenAddr = ":0"
+	}
 	var err error
-	s.listener, err = net.Listen("tcp", ":0")
+	s.listener, err = net.Listen("tcp", listenAddr)
 	if err != nil {
 		log.Fatal(err)
 	}
